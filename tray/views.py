@@ -1,6 +1,6 @@
 from datetime import timedelta
 from django.db import models
-from django.db.models import Count, Sum, Avg, Q, F, ExpressionWrapper, IntegerField
+from django.db.models import Count, Sum, Avg, Q, F, ExpressionWrapper, IntegerField, Case, When
 from django.utils import timezone
 from django.conf import settings
 from rest_framework import viewsets, status
@@ -15,7 +15,11 @@ from .serializers import (
     ReleaseObservingSerializer,
     AbnormalHandlingSerializer, AbnormalHandlingDetailSerializer,
     AbnormalHandlingCreateSerializer, AbnormalHandlingResolveSerializer,
-    AbnormalHandlingCloseSerializer
+    AbnormalHandlingCloseSerializer,
+    ReviewDiffDetailSerializer, ReviewAbnormalListSerializer,
+    ReviewTrayStatSerializer, ReviewAreaStatSerializer,
+    ReviewPersonStatSerializer, ReviewSessionStatSerializer,
+    TrayTrajectorySerializer, TrajectoryEventSerializer
 )
 from .filters import TrayFilter, TrayRecordFilter, InventoryRecordFilter, AbnormalHandlingFilter
 
@@ -688,3 +692,657 @@ class AbnormalHandlingViewSet(viewsets.ModelViewSet):
             'area_distribution': list(area_distribution),
             'source_distribution': list(source_distribution),
         })
+
+
+class ReviewViewSet(viewsets.ViewSet):
+
+    def _apply_time_filters(self, queryset, time_field, request):
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        if start_date:
+            queryset = queryset.filter(**{f'{time_field}__gte': start_date})
+        if end_date:
+            queryset = queryset.filter(**{f'{time_field}__lte': end_date + ' 23:59:59'})
+        return queryset
+
+    def _apply_common_filters(self, queryset, request, tray_prefix='tray__', record_prefix='tray_record__'):
+        tray_code = request.query_params.get('tray_code')
+        area = request.query_params.get('area')
+        responsible_person = request.query_params.get('responsible_person')
+        session = request.query_params.get('session')
+
+        if tray_code:
+            queryset = queryset.filter(**{f'{tray_prefix}tray_code__icontains': tray_code})
+        if area:
+            queryset = queryset.filter(**{f'{tray_prefix}area__icontains': area})
+        if responsible_person:
+            queryset = queryset.filter(**{f'{tray_prefix}responsible_person__icontains': responsible_person})
+        if session:
+            queryset = queryset.filter(**{f'{record_prefix}session__icontains': session})
+
+        return queryset
+
+    @action(detail=False, methods=['get'], url_path='overview')
+    def overview(self, request):
+        abnormals = AbnormalHandling.objects.select_related('tray', 'tray_record', 'inventory_record').all()
+        abnormals = self._apply_time_filters(abnormals, 'created_at', request)
+        abnormals = self._apply_common_filters(abnormals, request)
+
+        diff_records = InventoryRecord.objects.select_related('tray', 'tray_record').exclude(diff_count=0)
+        diff_records = self._apply_time_filters(diff_records, 'inventory_time', request)
+        diff_records = self._apply_common_filters(diff_records, request)
+
+        total_abnormal = abnormals.count()
+        pending_abnormal = abnormals.filter(status=AbnormalStatus.PENDING).count()
+        processing_abnormal = abnormals.filter(status=AbnormalStatus.PROCESSING).count()
+        resolved_abnormal = abnormals.filter(status=AbnormalStatus.RESOLVED).count()
+        closed_abnormal = abnormals.filter(status=AbnormalStatus.CLOSED).count()
+
+        now = timezone.now()
+        overdue_abnormal = abnormals.filter(
+            status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING],
+            expected_completion_time__isnull=False,
+            expected_completion_time__lt=now
+        ).count()
+
+        total_diff_amount = diff_records.aggregate(
+            total=Sum(
+                Case(
+                    When(diff_count__gt=0, then=F('diff_count')),
+                    When(diff_count__lt=0, then=-F('diff_count')),
+                    default=0,
+                    output_field=IntegerField()
+                )
+            )
+        )['total'] or 0
+
+        diff_record_count = diff_records.count()
+
+        source_distribution = list(
+            abnormals.values('source').annotate(count=Count('id')).order_by('-count')
+        )
+        for item in source_distribution:
+            item['source_display'] = AbnormalSource(item['source']).label
+
+        status_distribution = [
+            {'status': AbnormalStatus.PENDING, 'status_display': '待处理', 'count': pending_abnormal},
+            {'status': AbnormalStatus.PROCESSING, 'status_display': '处理中', 'count': processing_abnormal},
+            {'status': AbnormalStatus.RESOLVED, 'status_display': '已处理', 'count': resolved_abnormal},
+            {'status': AbnormalStatus.CLOSED, 'status_display': '已关闭', 'count': closed_abnormal},
+        ]
+
+        return Response({
+            'time_range': {
+                'start_date': request.query_params.get('start_date'),
+                'end_date': request.query_params.get('end_date'),
+            },
+            'filters': {
+                'tray_code': request.query_params.get('tray_code'),
+                'area': request.query_params.get('area'),
+                'responsible_person': request.query_params.get('responsible_person'),
+                'session': request.query_params.get('session'),
+            },
+            'abnormal_stats': {
+                'total': total_abnormal,
+                'pending': pending_abnormal,
+                'processing': processing_abnormal,
+                'resolved': resolved_abnormal,
+                'closed': closed_abnormal,
+                'overdue': overdue_abnormal,
+                'resolution_rate': round(
+                    (resolved_abnormal + closed_abnormal) / total_abnormal * 100, 2
+                ) if total_abnormal > 0 else 0,
+            },
+            'diff_stats': {
+                'record_count': diff_record_count,
+                'total_amount': total_diff_amount,
+                'avg_amount': round(total_diff_amount / diff_record_count, 2) if diff_record_count > 0 else 0,
+            },
+            'source_distribution': source_distribution,
+            'status_distribution': status_distribution,
+        })
+
+    @action(detail=False, methods=['get'], url_path='diff-details')
+    def diff_details(self, request):
+        queryset = InventoryRecord.objects.select_related(
+            'tray', 'tray_record'
+        ).prefetch_related(
+            'abnormal_handlings'
+        ).exclude(diff_count=0)
+
+        queryset = self._apply_time_filters(queryset, 'inventory_time', request)
+        queryset = self._apply_common_filters(queryset, request)
+
+        confirm_status = request.query_params.get('confirm_status')
+        has_abnormal = request.query_params.get('has_abnormal')
+        min_abs_diff = request.query_params.get('min_abs_diff')
+
+        if confirm_status:
+            queryset = queryset.filter(confirm_status=confirm_status)
+        if has_abnormal == 'true':
+            queryset = queryset.filter(abnormal_handlings__isnull=False)
+        elif has_abnormal == 'false':
+            queryset = queryset.filter(abnormal_handlings__isnull=True)
+        if min_abs_diff:
+            min_abs_diff = int(min_abs_diff)
+            queryset = queryset.filter(
+                Q(diff_count__gte=min_abs_diff) | Q(diff_count__lte=-min_abs_diff)
+            )
+
+        queryset = queryset.order_by('-inventory_time')
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = ReviewDiffDetailSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = ReviewDiffDetailSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'], url_path='abnormal-list')
+    def abnormal_list(self, request):
+        queryset = AbnormalHandling.objects.select_related(
+            'tray', 'tray_record', 'inventory_record'
+        ).all()
+
+        queryset = self._apply_time_filters(queryset, 'created_at', request)
+        queryset = self._apply_common_filters(queryset, request)
+
+        status = request.query_params.get('status')
+        source = request.query_params.get('source')
+        is_overdue = request.query_params.get('is_overdue')
+        handler = request.query_params.get('handler')
+
+        if status:
+            queryset = queryset.filter(status=status)
+        if source:
+            queryset = queryset.filter(source=source)
+        if handler:
+            queryset = queryset.filter(handler__icontains=handler)
+        if is_overdue == 'true':
+            queryset = queryset.filter(
+                status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING],
+                expected_completion_time__isnull=False,
+                expected_completion_time__lt=timezone.now()
+            )
+        elif is_overdue == 'false':
+            queryset = queryset.filter(
+                Q(status__in=[AbnormalStatus.RESOLVED, AbnormalStatus.CLOSED]) |
+                Q(expected_completion_time__isnull=True) |
+                Q(expected_completion_time__gte=timezone.now())
+            )
+
+        queryset = queryset.order_by('-created_at')
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = ReviewAbnormalListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = ReviewAbnormalListSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'], url_path='stats/by-tray')
+    def stats_by_tray(self, request):
+        abnormals = AbnormalHandling.objects.select_related('tray').all()
+        abnormals = self._apply_time_filters(abnormals, 'created_at', request)
+        abnormals = self._apply_common_filters(abnormals, request)
+
+        diff_records = InventoryRecord.objects.select_related('tray').exclude(diff_count=0)
+        diff_records = self._apply_time_filters(diff_records, 'inventory_time', request)
+        diff_records = self._apply_common_filters(diff_records, request)
+
+        tray_abnormal_stats = {
+            a['tray_id']: a for a in abnormals.values('tray_id').annotate(
+                abnormal_total=Count('id'),
+                abnormal_pending=Count('id', filter=Q(status=AbnormalStatus.PENDING)),
+                abnormal_processing=Count('id', filter=Q(status=AbnormalStatus.PROCESSING)),
+                abnormal_resolved=Count('id', filter=Q(status=AbnormalStatus.RESOLVED)),
+                abnormal_closed=Count('id', filter=Q(status=AbnormalStatus.CLOSED)),
+                abnormal_overdue=Count(
+                    'id',
+                    filter=Q(
+                        status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING],
+                        expected_completion_time__isnull=False,
+                        expected_completion_time__lt=timezone.now()
+                    )
+                ),
+            )
+        }
+
+        tray_diff_stats = {
+            d['tray_id']: d for d in diff_records.values('tray_id').annotate(
+                diff_total_amount=Sum(
+                    Case(
+                        When(diff_count__gt=0, then=F('diff_count')),
+                        When(diff_count__lt=0, then=-F('diff_count')),
+                        default=0,
+                        output_field=IntegerField()
+                    )
+                ),
+                diff_record_count=Count('id'),
+            )
+        }
+
+        tray_ids = set(tray_abnormal_stats.keys()) | set(tray_diff_stats.keys())
+        trays = Tray.objects.filter(id__in=tray_ids)
+
+        result = []
+        for tray in trays:
+            a_stat = tray_abnormal_stats.get(tray.id, {})
+            d_stat = tray_diff_stats.get(tray.id, {})
+            result.append({
+                'tray_id': tray.id,
+                'tray_code': tray.tray_code,
+                'area': tray.area,
+                'responsible_person': tray.responsible_person,
+                'abnormal_total': a_stat.get('abnormal_total', 0),
+                'abnormal_pending': a_stat.get('abnormal_pending', 0),
+                'abnormal_processing': a_stat.get('abnormal_processing', 0),
+                'abnormal_resolved': a_stat.get('abnormal_resolved', 0),
+                'abnormal_closed': a_stat.get('abnormal_closed', 0),
+                'abnormal_overdue': a_stat.get('abnormal_overdue', 0),
+                'diff_total_amount': d_stat.get('diff_total_amount', 0) or 0,
+                'diff_record_count': d_stat.get('diff_record_count', 0),
+            })
+
+        result.sort(key=lambda x: x['abnormal_total'] + x['diff_record_count'], reverse=True)
+
+        top_n = request.query_params.get('top_n')
+        if top_n:
+            result = result[:int(top_n)]
+
+        serializer = ReviewTrayStatSerializer(result, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'], url_path='stats/by-area')
+    def stats_by_area(self, request):
+        abnormals = AbnormalHandling.objects.select_related('tray').all()
+        abnormals = self._apply_time_filters(abnormals, 'created_at', request)
+        abnormals = self._apply_common_filters(abnormals, request)
+
+        diff_records = InventoryRecord.objects.select_related('tray').exclude(diff_count=0)
+        diff_records = self._apply_time_filters(diff_records, 'inventory_time', request)
+        diff_records = self._apply_common_filters(diff_records, request)
+
+        area_abnormal_stats = {
+            a['tray__area']: a for a in abnormals.values('tray__area').annotate(
+                abnormal_total=Count('id'),
+                abnormal_pending=Count('id', filter=Q(status=AbnormalStatus.PENDING)),
+                abnormal_processing=Count('id', filter=Q(status=AbnormalStatus.PROCESSING)),
+                abnormal_resolved=Count('id', filter=Q(status=AbnormalStatus.RESOLVED)),
+                abnormal_closed=Count('id', filter=Q(status=AbnormalStatus.CLOSED)),
+                abnormal_overdue=Count(
+                    'id',
+                    filter=Q(
+                        status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING],
+                        expected_completion_time__isnull=False,
+                        expected_completion_time__lt=timezone.now()
+                    )
+                ),
+            )
+        }
+
+        area_diff_stats = {
+            d['tray__area']: d for d in diff_records.values('tray__area').annotate(
+                diff_total_amount=Sum(
+                    Case(
+                        When(diff_count__gt=0, then=F('diff_count')),
+                        When(diff_count__lt=0, then=-F('diff_count')),
+                        default=0,
+                        output_field=IntegerField()
+                    )
+                ),
+            )
+        }
+
+        area_tray_counts = {
+            t['area']: t['count'] for t in Tray.objects.values('area').annotate(count=Count('id'))
+        }
+
+        area_names = set(area_abnormal_stats.keys()) | set(area_diff_stats.keys())
+
+        result = []
+        for area in area_names:
+            a_stat = area_abnormal_stats.get(area, {})
+            d_stat = area_diff_stats.get(area, {})
+            result.append({
+                'area': area,
+                'tray_count': area_tray_counts.get(area, 0),
+                'abnormal_total': a_stat.get('abnormal_total', 0),
+                'abnormal_pending': a_stat.get('abnormal_pending', 0),
+                'abnormal_processing': a_stat.get('abnormal_processing', 0),
+                'abnormal_resolved': a_stat.get('abnormal_resolved', 0),
+                'abnormal_closed': a_stat.get('abnormal_closed', 0),
+                'abnormal_overdue': a_stat.get('abnormal_overdue', 0),
+                'diff_total_amount': d_stat.get('diff_total_amount', 0) or 0,
+            })
+
+        result.sort(key=lambda x: x['abnormal_total'], reverse=True)
+
+        serializer = ReviewAreaStatSerializer(result, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'], url_path='stats/by-person')
+    def stats_by_person(self, request):
+        abnormals = AbnormalHandling.objects.select_related('tray').all()
+        abnormals = self._apply_time_filters(abnormals, 'created_at', request)
+        abnormals = self._apply_common_filters(abnormals, request)
+
+        diff_records = InventoryRecord.objects.select_related('tray').exclude(diff_count=0)
+        diff_records = self._apply_time_filters(diff_records, 'inventory_time', request)
+        diff_records = self._apply_common_filters(diff_records, request)
+
+        person_abnormal_stats = {
+            a['tray__responsible_person']: a for a in abnormals.values('tray__responsible_person').annotate(
+                abnormal_total=Count('id'),
+                abnormal_pending=Count('id', filter=Q(status=AbnormalStatus.PENDING)),
+                abnormal_processing=Count('id', filter=Q(status=AbnormalStatus.PROCESSING)),
+                abnormal_resolved=Count('id', filter=Q(status=AbnormalStatus.RESOLVED)),
+                abnormal_closed=Count('id', filter=Q(status=AbnormalStatus.CLOSED)),
+                abnormal_overdue=Count(
+                    'id',
+                    filter=Q(
+                        status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING],
+                        expected_completion_time__isnull=False,
+                        expected_completion_time__lt=timezone.now()
+                    )
+                ),
+            )
+        }
+
+        person_diff_stats = {
+            d['tray__responsible_person']: d for d in diff_records.values('tray__responsible_person').annotate(
+                diff_total_amount=Sum(
+                    Case(
+                        When(diff_count__gt=0, then=F('diff_count')),
+                        When(diff_count__lt=0, then=-F('diff_count')),
+                        default=0,
+                        output_field=IntegerField()
+                    )
+                ),
+            )
+        }
+
+        person_tray_counts = {
+            t['responsible_person']: t['count'] for t in Tray.objects.values('responsible_person').annotate(count=Count('id'))
+        }
+
+        person_names = set(person_abnormal_stats.keys()) | set(person_diff_stats.keys())
+
+        result = []
+        for person in person_names:
+            a_stat = person_abnormal_stats.get(person, {})
+            d_stat = person_diff_stats.get(person, {})
+            result.append({
+                'responsible_person': person,
+                'tray_count': person_tray_counts.get(person, 0),
+                'abnormal_total': a_stat.get('abnormal_total', 0),
+                'abnormal_pending': a_stat.get('abnormal_pending', 0),
+                'abnormal_processing': a_stat.get('abnormal_processing', 0),
+                'abnormal_resolved': a_stat.get('abnormal_resolved', 0),
+                'abnormal_closed': a_stat.get('abnormal_closed', 0),
+                'abnormal_overdue': a_stat.get('abnormal_overdue', 0),
+                'diff_total_amount': d_stat.get('diff_total_amount', 0) or 0,
+            })
+
+        result.sort(key=lambda x: x['abnormal_total'], reverse=True)
+
+        serializer = ReviewPersonStatSerializer(result, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'], url_path='stats/by-session')
+    def stats_by_session(self, request):
+        records = TrayRecord.objects.all()
+        records = self._apply_time_filters(records, 'receive_time', request)
+        records = self._apply_common_filters(records, request)
+
+        abnormals = AbnormalHandling.objects.select_related('tray_record').all()
+        abnormals = self._apply_time_filters(abnormals, 'created_at', request)
+        abnormals = self._apply_common_filters(abnormals, request)
+
+        diff_records = InventoryRecord.objects.select_related('tray_record').exclude(diff_count=0)
+        diff_records = self._apply_time_filters(diff_records, 'inventory_time', request)
+        diff_records = self._apply_common_filters(diff_records, request)
+
+        session_record_stats = {
+            s['session']: s['count'] for s in records.values('session').annotate(count=Count('id'))
+        }
+
+        session_abnormal_stats = {
+            a['tray_record__session']: a for a in abnormals.filter(
+                tray_record__session__isnull=False
+            ).values('tray_record__session').annotate(
+                abnormal_total=Count('id'),
+                abnormal_pending=Count('id', filter=Q(status=AbnormalStatus.PENDING)),
+            )
+        }
+
+        session_diff_stats = {
+            d['tray_record__session']: d for d in diff_records.filter(
+                tray_record__session__isnull=False
+            ).values('tray_record__session').annotate(
+                diff_total_amount=Sum(
+                    Case(
+                        When(diff_count__gt=0, then=F('diff_count')),
+                        When(diff_count__lt=0, then=-F('diff_count')),
+                        default=0,
+                        output_field=IntegerField()
+                    )
+                ),
+            )
+        }
+
+        session_names = set(session_record_stats.keys()) | set(session_abnormal_stats.keys()) | set(session_diff_stats.keys())
+
+        result = []
+        for session in session_names:
+            a_stat = session_abnormal_stats.get(session, {})
+            d_stat = session_diff_stats.get(session, {})
+            result.append({
+                'session': session,
+                'record_count': session_record_stats.get(session, 0),
+                'abnormal_total': a_stat.get('abnormal_total', 0),
+                'abnormal_pending': a_stat.get('abnormal_pending', 0),
+                'diff_total_amount': d_stat.get('diff_total_amount', 0) or 0,
+            })
+
+        result.sort(key=lambda x: x['abnormal_total'], reverse=True)
+
+        serializer = ReviewSessionStatSerializer(result, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'], url_path='pending-items')
+    def pending_items(self, request):
+        now = timezone.now()
+
+        pending_abnormals = AbnormalHandling.objects.select_related('tray', 'tray_record').filter(
+            status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+        ).order_by('expected_completion_time')
+
+        area = request.query_params.get('area')
+        responsible_person = request.query_params.get('responsible_person')
+        is_overdue = request.query_params.get('is_overdue')
+
+        if area:
+            pending_abnormals = pending_abnormals.filter(tray__area__icontains=area)
+        if responsible_person:
+            pending_abnormals = pending_abnormals.filter(tray__responsible_person__icontains=responsible_person)
+        if is_overdue == 'true':
+            pending_abnormals = pending_abnormals.filter(
+                expected_completion_time__isnull=False,
+                expected_completion_time__lt=now
+            )
+        elif is_overdue == 'false':
+            pending_abnormals = pending_abnormals.filter(
+                Q(expected_completion_time__isnull=True) |
+                Q(expected_completion_time__gte=now)
+            )
+
+        pending_confirms = InventoryRecord.objects.select_related('tray', 'tray_record').filter(
+            confirm_status=ConfirmStatus.PENDING
+        )
+        if area:
+            pending_confirms = pending_confirms.filter(tray__area__icontains=area)
+        if responsible_person:
+            pending_confirms = pending_confirms.filter(tray__responsible_person__icontains=responsible_person)
+
+        pending_confirms = pending_confirms.order_by('inventory_time')
+
+        return Response({
+            'pending_abnormal_count': pending_abnormals.count(),
+            'pending_confirm_count': pending_confirms.count(),
+            'overdue_abnormal_count': pending_abnormals.filter(
+                expected_completion_time__isnull=False,
+                expected_completion_time__lt=now
+            ).count(),
+            'pending_abnormals': ReviewAbnormalListSerializer(pending_abnormals[:50], many=True).data,
+            'pending_confirms': ReviewDiffDetailSerializer(pending_confirms[:50], many=True).data,
+        })
+
+    @action(detail=True, methods=['get'], url_path='trajectory')
+    def trajectory(self, request, pk=None):
+        try:
+            tray = Tray.objects.get(pk=pk)
+        except Tray.DoesNotExist:
+            return Response({'detail': '托盘不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        events = []
+
+        records = TrayRecord.objects.filter(tray=tray).order_by('receive_time')
+        for record in records:
+            if record.receive_time:
+                events.append({
+                    'event_type': 'pickup',
+                    'event_type_display': '托盘领取',
+                    'event_time': record.receive_time,
+                    'operator': record.receiver,
+                    'description': f'领取托盘，场次：{record.session}',
+                    'detail': {
+                        'record_id': record.id,
+                        'session': record.session,
+                        'receiver': record.receiver,
+                    }
+                })
+            if record.return_time:
+                events.append({
+                    'event_type': 'return',
+                    'event_type_display': '托盘归还',
+                    'event_time': record.return_time,
+                    'operator': record.receiver,
+                    'description': f'归还托盘，场次：{record.session}',
+                    'detail': {
+                        'record_id': record.id,
+                        'session': record.session,
+                        'receiver': record.receiver,
+                    }
+                })
+
+        inventories = InventoryRecord.objects.filter(tray=tray).order_by('inventory_time')
+        for inv in inventories:
+            events.append({
+                'event_type': 'inventory',
+                'event_type_display': '托盘清点',
+                'event_time': inv.inventory_time,
+                'operator': None,
+                'description': f'清点完成，实际{inv.actual_count}，应存{inv.expected_count}，差异{inv.diff_count:+d}',
+                'detail': {
+                    'inventory_id': inv.id,
+                    'actual_count': inv.actual_count,
+                    'expected_count': inv.expected_count,
+                    'diff_count': inv.diff_count,
+                    'diff_description': inv.diff_description,
+                    'confirm_status': inv.confirm_status,
+                    'confirm_status_display': inv.get_confirm_status_display(),
+                    'confirmer': inv.confirmer,
+                    'confirm_time': inv.confirm_time.isoformat() if inv.confirm_time else None,
+                    'conclusion': inv.conclusion,
+                }
+            })
+
+        abnormals = AbnormalHandling.objects.filter(tray=tray).order_by('created_at')
+        for abn in abnormals:
+            events.append({
+                'event_type': 'abnormal_register',
+                'event_type_display': '异常登记',
+                'event_time': abn.created_at,
+                'operator': abn.handler,
+                'description': f'登记异常（{abn.get_source_display()}）：{abn.description}',
+                'detail': {
+                    'abnormal_id': abn.id,
+                    'source': abn.source,
+                    'source_display': abn.get_source_display(),
+                    'description': abn.description,
+                    'handler': abn.handler,
+                    'measures': abn.measures,
+                    'expected_completion_time': abn.expected_completion_time.isoformat() if abn.expected_completion_time else None,
+                    'status': abn.status,
+                    'status_display': abn.get_status_display(),
+                }
+            })
+            if abn.resolved_at:
+                events.append({
+                    'event_type': 'abnormal_resolve',
+                    'event_type_display': '异常处理完成',
+                    'event_time': abn.resolved_at,
+                    'operator': abn.handler,
+                    'description': f'异常处理完成：{abn.result}',
+                    'detail': {
+                        'abnormal_id': abn.id,
+                        'result': abn.result,
+                        'handler': abn.handler,
+                    }
+                })
+            if abn.closed_at:
+                events.append({
+                    'event_type': 'abnormal_close',
+                    'event_type_display': '异常关闭归档',
+                    'event_time': abn.closed_at,
+                    'operator': None,
+                    'description': '异常单已关闭归档',
+                    'detail': {
+                        'abnormal_id': abn.id,
+                    }
+                })
+
+        events.sort(key=lambda x: x['event_time'])
+
+        pending_abnormal_count = abnormals.filter(
+            status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+        ).count()
+
+        data = {
+            'tray_id': tray.id,
+            'tray_code': tray.tray_code,
+            'area': tray.area,
+            'responsible_person': tray.responsible_person,
+            'current_status': tray.status,
+            'current_status_display': tray.get_status_display(),
+            'total_events': len(events),
+            'total_abnormal': abnormals.count(),
+            'pending_abnormal': pending_abnormal_count,
+            'events': events,
+        }
+
+        serializer = TrayTrajectorySerializer(data)
+        return Response(serializer.data)
+
+    @property
+    def paginator(self):
+        from rest_framework.pagination import PageNumberPagination
+        if not hasattr(self, '_paginator'):
+            self._paginator = PageNumberPagination()
+            self._paginator.page_size = 20
+        return self._paginator
+
+    def paginate_queryset(self, queryset):
+        page_size = self.request.query_params.get('page_size')
+        if page_size:
+            try:
+                self.paginator.page_size = int(page_size)
+            except (ValueError, TypeError):
+                pass
+        return self.paginator.paginate_queryset(queryset, self.request, view=self)
+
+    def get_paginated_response(self, data):
+        return self.paginator.get_paginated_response(data)

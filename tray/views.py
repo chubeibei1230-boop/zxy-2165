@@ -163,16 +163,15 @@ class TrayViewSet(viewsets.ModelViewSet):
         if tray.status == TrayStatus.OBSERVING and not conclusion:
             return Response({'detail': '观察中的托盘确认时必须填写确认结论'}, status=status.HTTP_400_BAD_REQUEST)
 
-        if tray.status == TrayStatus.OBSERVING:
-            pending_abnormal_count = AbnormalHandling.objects.filter(
-                tray=tray,
-                status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
-            ).count()
-            if pending_abnormal_count > 0:
-                return Response(
-                    {'detail': f'该托盘存在{pending_abnormal_count}个未处理的异常单，请先处理异常后再确认'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+        pending_abnormal_count = AbnormalHandling.objects.filter(
+            tray=tray,
+            status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+        ).count()
+        if pending_abnormal_count > 0:
+            return Response(
+                {'detail': f'该托盘存在{pending_abnormal_count}个未处理的异常单，请先处理异常后再确认'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         pending_count = InventoryRecord.objects.filter(
             tray=tray,
@@ -557,6 +556,8 @@ class AbnormalHandlingViewSet(viewsets.ModelViewSet):
                 tray_record = TrayRecord.objects.get(id=data['tray_record_id'], tray=tray)
             except TrayRecord.DoesNotExist:
                 return Response({'detail': '领还记录不存在或不属于该托盘'}, status=status.HTTP_400_BAD_REQUEST)
+        elif inventory_record and inventory_record.tray_record:
+            tray_record = inventory_record.tray_record
 
         abnormal = AbnormalHandling.objects.create(
             tray=tray,
@@ -604,7 +605,7 @@ class AbnormalHandlingViewSet(viewsets.ModelViewSet):
             abnormal.inventory_record.save()
 
         tray = abnormal.tray
-        if tray.status == TrayStatus.OBSERVING:
+        if tray.status in [TrayStatus.OBSERVING, TrayStatus.PENDING_CONFIRM]:
             pending_abnormals = AbnormalHandling.objects.filter(
                 tray=tray,
                 status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
@@ -1095,7 +1096,7 @@ class ReviewViewSet(viewsets.ViewSet):
     def stats_by_session(self, request):
         records = TrayRecord.objects.all()
         records = self._apply_time_filters(records, 'receive_time', request)
-        records = self._apply_common_filters(records, request)
+        records = self._apply_common_filters(records, request, record_prefix='')
 
         abnormals = AbnormalHandling.objects.select_related('tray_record').all()
         abnormals = self._apply_time_filters(abnormals, 'created_at', request)

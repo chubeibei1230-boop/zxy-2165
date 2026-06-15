@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Tray, TrayRecord, InventoryRecord, AbnormalHandling
+from .models import Tray, TrayRecord, InventoryRecord, AbnormalHandling, ReviewTask
 
 
 @admin.register(Tray)
@@ -32,3 +32,23 @@ class AbnormalHandlingAdmin(admin.ModelAdmin):
     list_filter = ['status', 'source', 'handler', 'tray__area']
     search_fields = ['tray__tray_code', 'handler', 'description', 'measures', 'result']
     readonly_fields = ['created_at', 'updated_at', 'resolved_at', 'closed_at']
+
+
+@admin.register(ReviewTask)
+class ReviewTaskAdmin(admin.ModelAdmin):
+    list_display = [
+        'task_code', 'tray', 'source', 'status', 'reviewer',
+        'priority', 'review_result', 'created_at', 'completed_time'
+    ]
+    list_filter = [
+        'status', 'source', 'priority', 'review_result',
+        'reviewer', 'tray__area'
+    ]
+    search_fields = [
+        'task_code', 'tray__tray_code', 'reviewer', 'description',
+        'review_opinion', 'creator'
+    ]
+    readonly_fields = [
+        'created_at', 'updated_at', 'task_code', 'review_time',
+        'assign_time', 'completed_time', 'cancelled_time'
+    ]

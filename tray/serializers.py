@@ -1,5 +1,9 @@
 from rest_framework import serializers
-from .models import Tray, TrayRecord, InventoryRecord, TrayStatus, ConfirmStatus, AbnormalHandling, AbnormalSource, AbnormalStatus
+from .models import (
+    Tray, TrayRecord, InventoryRecord, TrayStatus, ConfirmStatus,
+    AbnormalHandling, AbnormalSource, AbnormalStatus,
+    ReviewTask, ReviewTaskStatus, ReviewTaskSource, ReviewResult
+)
 
 
 class TraySerializer(serializers.ModelSerializer):
@@ -247,3 +251,75 @@ class TrayTrajectorySerializer(serializers.Serializer):
     total_abnormal = serializers.IntegerField()
     pending_abnormal = serializers.IntegerField()
     events = TrajectoryEventSerializer(many=True)
+
+
+class ReviewTaskSerializer(serializers.ModelSerializer):
+    tray_code = serializers.CharField(source='tray.tray_code', read_only=True)
+    tray_area = serializers.CharField(source='tray.area', read_only=True)
+    tray_responsible_person = serializers.CharField(source='tray.responsible_person', read_only=True)
+    session = serializers.CharField(source='tray_record.session', read_only=True, allow_null=True)
+    receiver = serializers.CharField(source='tray_record.receiver', read_only=True, allow_null=True)
+    source_display = serializers.CharField(source='get_source_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    review_result_display = serializers.CharField(source='get_review_result_display', read_only=True, allow_null=True)
+    priority_display = serializers.CharField(source='get_priority_display', read_only=True)
+    inventory_diff_count = serializers.IntegerField(source='inventory_record.diff_count', read_only=True, allow_null=True)
+    abnormal_status = serializers.CharField(source='abnormal_handling.status', read_only=True, allow_null=True)
+    abnormal_status_display = serializers.CharField(source='abnormal_handling.get_status_display', read_only=True, allow_null=True)
+
+    class Meta:
+        model = ReviewTask
+        fields = '__all__'
+        read_only_fields = [
+            'created_at', 'updated_at', 'task_code', 'review_time',
+            'assign_time', 'completed_time', 'cancelled_time'
+        ]
+
+
+class ReviewTaskDetailSerializer(ReviewTaskSerializer):
+    tray_detail = TraySerializer(source='tray', read_only=True)
+    tray_record_detail = TrayRecordSerializer(source='tray_record', read_only=True)
+    inventory_record_detail = InventoryRecordSerializer(source='inventory_record', read_only=True)
+    abnormal_handling_detail = AbnormalHandlingSerializer(source='abnormal_handling', read_only=True)
+
+    class Meta(ReviewTaskSerializer.Meta):
+        fields = '__all__'
+
+
+class ReviewTaskCreateSerializer(serializers.Serializer):
+    tray_id = serializers.IntegerField()
+    inventory_record_id = serializers.IntegerField(required=False, allow_null=True)
+    tray_record_id = serializers.IntegerField(required=False, allow_null=True)
+    abnormal_handling_id = serializers.IntegerField(required=False, allow_null=True)
+    source = serializers.ChoiceField(choices=ReviewTaskSource.choices, default=ReviewTaskSource.MANUAL)
+    description = serializers.CharField(required=False, default='', allow_blank=True)
+    priority = serializers.ChoiceField(
+        choices=[('high', '高'), ('medium', '中'), ('low', '低')],
+        required=False, default='medium'
+    )
+    creator = serializers.CharField(required=False, default='', allow_blank=True)
+    reviewer = serializers.CharField(required=False, default='', allow_blank=True)
+
+
+class ReviewTaskAssignSerializer(serializers.Serializer):
+    reviewer = serializers.CharField(max_length=50)
+
+
+class ReviewTaskSubmitSerializer(serializers.Serializer):
+    review_result = serializers.ChoiceField(choices=ReviewResult.choices)
+    review_opinion = serializers.CharField(required=False, default='', allow_blank=True)
+
+
+class ReviewTaskCancelSerializer(serializers.Serializer):
+    cancel_reason = serializers.CharField()
+
+
+class ReviewTaskStatsSerializer(serializers.Serializer):
+    total = serializers.IntegerField()
+    pending_assign = serializers.IntegerField()
+    processing = serializers.IntegerField()
+    completed = serializers.IntegerField()
+    cancelled = serializers.IntegerField()
+    completion_rate = serializers.FloatField()
+    source_distribution = serializers.ListField(child=serializers.DictField())
+    priority_distribution = serializers.ListField(child=serializers.DictField())

@@ -8,7 +8,11 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Tray, TrayRecord, InventoryRecord, TrayStatus, ConfirmStatus, AbnormalHandling, AbnormalSource, AbnormalStatus
+from .models import (
+    Tray, TrayRecord, InventoryRecord, TrayStatus, ConfirmStatus,
+    AbnormalHandling, AbnormalSource, AbnormalStatus,
+    ReviewTask, ReviewTaskStatus, ReviewTaskSource, ReviewResult
+)
 from .serializers import (
     TraySerializer, TrayRecordSerializer, InventoryRecordSerializer,
     PickupSerializer, ReturnSerializer, InventorySerializer, ConfirmSerializer,
@@ -19,9 +23,13 @@ from .serializers import (
     ReviewDiffDetailSerializer, ReviewAbnormalListSerializer,
     ReviewTrayStatSerializer, ReviewAreaStatSerializer,
     ReviewPersonStatSerializer, ReviewSessionStatSerializer,
-    TrayTrajectorySerializer, TrajectoryEventSerializer
+    TrayTrajectorySerializer, TrajectoryEventSerializer,
+    ReviewTaskSerializer, ReviewTaskDetailSerializer,
+    ReviewTaskCreateSerializer, ReviewTaskAssignSerializer,
+    ReviewTaskSubmitSerializer, ReviewTaskCancelSerializer,
+    ReviewTaskStatsSerializer
 )
-from .filters import TrayFilter, TrayRecordFilter, InventoryRecordFilter, AbnormalHandlingFilter
+from .filters import TrayFilter, TrayRecordFilter, InventoryRecordFilter, AbnormalHandlingFilter, ReviewTaskFilter
 
 
 class TrayViewSet(viewsets.ModelViewSet):
@@ -1327,6 +1335,459 @@ class ReviewViewSet(viewsets.ViewSet):
 
         serializer = TrayTrajectorySerializer(data)
         return Response(serializer.data)
+
+    @property
+    def paginator(self):
+        from rest_framework.pagination import PageNumberPagination
+        if not hasattr(self, '_paginator'):
+            self._paginator = PageNumberPagination()
+            self._paginator.page_size = 20
+        return self._paginator
+
+    def paginate_queryset(self, queryset):
+        page_size = self.request.query_params.get('page_size')
+        if page_size:
+            try:
+                self.paginator.page_size = int(page_size)
+            except (ValueError, TypeError):
+                pass
+        return self.paginator.paginate_queryset(queryset, self.request, view=self)
+
+    def get_paginated_response(self, data):
+        return self.paginator.get_paginated_response(data)
+
+
+class ReviewTaskViewSet(viewsets.ModelViewSet):
+    queryset = ReviewTask.objects.select_related(
+        'tray', 'tray_record', 'inventory_record', 'abnormal_handling'
+    ).all()
+    serializer_class = ReviewTaskSerializer
+    filterset_class = ReviewTaskFilter
+    search_fields = [
+        'task_code', 'tray__tray_code', 'reviewer', 'description',
+        'review_opinion', 'creator'
+    ]
+    ordering_fields = [
+        'created_at', 'updated_at', 'priority', 'review_time',
+        'completed_time', 'task_code'
+    ]
+
+    def get_serializer_class(self):
+        if self.action == 'retrieve':
+            return ReviewTaskDetailSerializer
+        if self.action == 'create':
+            return ReviewTaskCreateSerializer
+        if self.action == 'assign':
+            return ReviewTaskAssignSerializer
+        if self.action == 'submit':
+            return ReviewTaskSubmitSerializer
+        if self.action == 'cancel':
+            return ReviewTaskCancelSerializer
+        if self.action == 'stats_overview':
+            return ReviewTaskStatsSerializer
+        return ReviewTaskSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            tray = Tray.objects.get(id=data['tray_id'])
+        except Tray.DoesNotExist:
+            return Response({'detail': '托盘不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        inventory_record = None
+        if data.get('inventory_record_id'):
+            try:
+                inventory_record = InventoryRecord.objects.get(
+                    id=data['inventory_record_id'], tray=tray
+                )
+            except InventoryRecord.DoesNotExist:
+                return Response(
+                    {'detail': '清点记录不存在或不属于该托盘'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        tray_record = None
+        if data.get('tray_record_id'):
+            try:
+                tray_record = TrayRecord.objects.get(
+                    id=data['tray_record_id'], tray=tray
+                )
+            except TrayRecord.DoesNotExist:
+                return Response(
+                    {'detail': '领还记录不存在或不属于该托盘'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        elif inventory_record and inventory_record.tray_record:
+            tray_record = inventory_record.tray_record
+
+        abnormal_handling = None
+        if data.get('abnormal_handling_id'):
+            try:
+                abnormal_handling = AbnormalHandling.objects.get(
+                    id=data['abnormal_handling_id'], tray=tray
+                )
+            except AbnormalHandling.DoesNotExist:
+                return Response(
+                    {'detail': '异常处理单不存在或不属于该托盘'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        reviewer = data.get('reviewer', '')
+        task_status = ReviewTaskStatus.PENDING_ASSIGN
+        assign_time = None
+        if reviewer:
+            task_status = ReviewTaskStatus.PROCESSING
+            assign_time = timezone.now()
+
+        review_task = ReviewTask.objects.create(
+            tray=tray,
+            tray_record=tray_record,
+            inventory_record=inventory_record,
+            abnormal_handling=abnormal_handling,
+            source=data.get('source', ReviewTaskSource.MANUAL),
+            status=task_status,
+            reviewer=reviewer,
+            description=data.get('description', ''),
+            priority=data.get('priority', 'medium'),
+            creator=data.get('creator', ''),
+            assign_time=assign_time,
+        )
+
+        return Response(
+            ReviewTaskDetailSerializer(review_task).data,
+            status=status.HTTP_201_CREATED
+        )
+
+    @action(detail=True, methods=['post'], serializer_class=ReviewTaskAssignSerializer)
+    def assign(self, request, pk=None):
+        task = self.get_object()
+
+        if task.status not in [ReviewTaskStatus.PENDING_ASSIGN, ReviewTaskStatus.PROCESSING]:
+            return Response(
+                {'detail': f'当前任务状态为{task.get_status_display()}，不能指派'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        task.reviewer = data['reviewer']
+        task.status = ReviewTaskStatus.PROCESSING
+        task.assign_time = timezone.now()
+        task.save()
+
+        return Response(ReviewTaskDetailSerializer(task).data)
+
+    @action(detail=True, methods=['post'], serializer_class=ReviewTaskSubmitSerializer)
+    def submit(self, request, pk=None):
+        task = self.get_object()
+
+        if task.status != ReviewTaskStatus.PROCESSING:
+            return Response(
+                {'detail': f'当前任务状态为{task.get_status_display()}，只有处理中状态才能提交复核结论'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        task.review_result = data['review_result']
+        task.review_opinion = data.get('review_opinion', '')
+        task.review_time = timezone.now()
+        task.status = ReviewTaskStatus.COMPLETED
+        task.completed_time = timezone.now()
+        task.save()
+
+        self._sync_review_result_to_tray(task)
+
+        return Response({
+            'task': ReviewTaskDetailSerializer(task).data,
+            'tray': TraySerializer(task.tray).data,
+        })
+
+    def _sync_review_result_to_tray(self, task):
+        tray = task.tray
+        review_result = task.review_result
+
+        if review_result == ReviewResult.FALSE_ALARM:
+            if tray.status in [TrayStatus.OBSERVING, TrayStatus.PENDING_CONFIRM]:
+                pending_abnormals = AbnormalHandling.objects.filter(
+                    tray=tray,
+                    status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+                ).count()
+                pending_confirms = InventoryRecord.objects.filter(
+                    tray=tray,
+                    confirm_status=ConfirmStatus.PENDING
+                ).count()
+                if pending_abnormals == 0 and pending_confirms == 0:
+                    tray.status = TrayStatus.AVAILABLE
+                    if tray.remark:
+                        tray.remark = tray.remark + f'\n[{timezone.now().strftime("%Y-%m-%d %H:%M:%S")}] 复核结论为误报，托盘恢复可用，复核人：{task.reviewer}'
+                    else:
+                        tray.remark = f'[{timezone.now().strftime("%Y-%m-%d %H:%M:%S")}] 复核结论为误报，托盘恢复可用，复核人：{task.reviewer}'
+                    tray.save()
+        elif review_result in [ReviewResult.CONFIRMED_ABNORMAL, ReviewResult.PARTIAL_ABNORMAL]:
+            if task.abnormal_handling:
+                abnormal = task.abnormal_handling
+                if abnormal.status == AbnormalStatus.PENDING:
+                    abnormal.status = AbnormalStatus.PROCESSING
+                    abnormal.save()
+
+    @action(detail=True, methods=['post'], serializer_class=ReviewTaskCancelSerializer)
+    def cancel(self, request, pk=None):
+        task = self.get_object()
+
+        if task.status in [ReviewTaskStatus.COMPLETED, ReviewTaskStatus.CANCELLED]:
+            return Response(
+                {'detail': f'当前任务状态为{task.get_status_display()}，不能取消'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        task.status = ReviewTaskStatus.CANCELLED
+        task.cancel_reason = data['cancel_reason']
+        task.cancelled_time = timezone.now()
+        task.save()
+
+        return Response(ReviewTaskDetailSerializer(task).data)
+
+    @action(detail=False, methods=['get'], url_path='stats/overview')
+    def stats_overview(self, request):
+        queryset = self.filter_queryset(self.get_queryset())
+
+        total = queryset.count()
+        pending_assign = queryset.filter(status=ReviewTaskStatus.PENDING_ASSIGN).count()
+        processing = queryset.filter(status=ReviewTaskStatus.PROCESSING).count()
+        completed = queryset.filter(status=ReviewTaskStatus.COMPLETED).count()
+        cancelled = queryset.filter(status=ReviewTaskStatus.CANCELLED).count()
+
+        completion_rate = round(
+            completed / total * 100, 2
+        ) if total > 0 else 0
+
+        source_distribution = list(
+            queryset.values('source').annotate(count=Count('id')).order_by('-count')
+        )
+        for item in source_distribution:
+            item['source_display'] = ReviewTaskSource(item['source']).label
+
+        priority_distribution = list(
+            queryset.values('priority').annotate(count=Count('id')).order_by('-count')
+        )
+        priority_map = {'high': '高', 'medium': '中', 'low': '低'}
+        for item in priority_distribution:
+            item['priority_display'] = priority_map.get(item['priority'], item['priority'])
+
+        return Response({
+            'total': total,
+            'pending_assign': pending_assign,
+            'processing': processing,
+            'completed': completed,
+            'cancelled': cancelled,
+            'completion_rate': completion_rate,
+            'source_distribution': source_distribution,
+            'priority_distribution': priority_distribution,
+        })
+
+    @action(detail=False, methods=['post'], url_path='auto-generate')
+    def auto_generate(self, request):
+        generated_count = 0
+        generated_tasks = []
+
+        inventory_diff_tasks = self._generate_from_inventory_diff()
+        generated_count += len(inventory_diff_tasks)
+        generated_tasks.extend(inventory_diff_tasks)
+
+        observing_tray_tasks = self._generate_from_observing_trays()
+        generated_count += len(observing_tray_tasks)
+        generated_tasks.extend(observing_tray_tasks)
+
+        unclosed_abnormal_tasks = self._generate_from_unclosed_abnormals()
+        generated_count += len(unclosed_abnormal_tasks)
+        generated_tasks.extend(unclosed_abnormal_tasks)
+
+        return Response({
+            'generated_count': generated_count,
+            'tasks': ReviewTaskSerializer(generated_tasks, many=True).data,
+        })
+
+    def _generate_from_inventory_diff(self):
+        tasks = []
+        threshold = getattr(settings, 'DIFF_THRESHOLD', 5)
+
+        diff_records = InventoryRecord.objects.filter(
+            confirm_status=ConfirmStatus.PENDING,
+        ).filter(
+            Q(diff_count__gt=threshold) | Q(diff_count__lt=-threshold)
+        ).select_related('tray', 'tray_record')
+
+        for record in diff_records:
+            existing_task = ReviewTask.objects.filter(
+                tray=record.tray,
+                inventory_record=record,
+                source=ReviewTaskSource.INVENTORY_DIFF,
+                status__in=[
+                    ReviewTaskStatus.PENDING_ASSIGN,
+                    ReviewTaskStatus.PROCESSING
+                ]
+            ).exists()
+
+            if not existing_task:
+                task = ReviewTask.objects.create(
+                    tray=record.tray,
+                    tray_record=record.tray_record,
+                    inventory_record=record,
+                    source=ReviewTaskSource.INVENTORY_DIFF,
+                    status=ReviewTaskStatus.PENDING_ASSIGN,
+                    description=f'清点差异自动生成复核任务，差异数量：{record.diff_count:+d}',
+                    priority='high' if abs(record.diff_count) > threshold * 2 else 'medium',
+                    creator='system',
+                )
+                tasks.append(task)
+
+        return tasks
+
+    def _generate_from_observing_trays(self):
+        tasks = []
+
+        observing_trays = Tray.objects.filter(
+            status=TrayStatus.OBSERVING
+        )
+
+        for tray in observing_trays:
+            existing_task = ReviewTask.objects.filter(
+                tray=tray,
+                source=ReviewTaskSource.OBSERVING_TRAY,
+                status__in=[
+                    ReviewTaskStatus.PENDING_ASSIGN,
+                    ReviewTaskStatus.PROCESSING
+                ]
+            ).exists()
+
+            if not existing_task:
+                latest_inventory = tray.inventory_records.order_by('-created_at').first()
+                latest_record = tray.records.order_by('-created_at').first()
+
+                task = ReviewTask.objects.create(
+                    tray=tray,
+                    tray_record=latest_record,
+                    inventory_record=latest_inventory,
+                    source=ReviewTaskSource.OBSERVING_TRAY,
+                    status=ReviewTaskStatus.PENDING_ASSIGN,
+                    description='观察中托盘自动生成复核任务',
+                    priority='medium',
+                    creator='system',
+                )
+                tasks.append(task)
+
+        return tasks
+
+    def _generate_from_unclosed_abnormals(self):
+        tasks = []
+
+        unclosed_abnormals = AbnormalHandling.objects.filter(
+            status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+        ).select_related('tray', 'tray_record', 'inventory_record')
+
+        for abnormal in unclosed_abnormals:
+            from datetime import timedelta
+            if timezone.now() - abnormal.created_at < timedelta(days=3):
+                continue
+
+            existing_task = ReviewTask.objects.filter(
+                tray=abnormal.tray,
+                abnormal_handling=abnormal,
+                source=ReviewTaskSource.UNCLOSED_ABNORMAL,
+                status__in=[
+                    ReviewTaskStatus.PENDING_ASSIGN,
+                    ReviewTaskStatus.PROCESSING
+                ]
+            ).exists()
+
+            if not existing_task:
+                task = ReviewTask.objects.create(
+                    tray=abnormal.tray,
+                    tray_record=abnormal.tray_record,
+                    inventory_record=abnormal.inventory_record,
+                    abnormal_handling=abnormal,
+                    source=ReviewTaskSource.UNCLOSED_ABNORMAL,
+                    status=ReviewTaskStatus.PENDING_ASSIGN,
+                    description=f'未关闭异常自动生成复核任务，异常状态：{abnormal.get_status_display()}',
+                    priority='high',
+                    creator='system',
+                )
+                tasks.append(task)
+
+        return tasks
+
+    @action(detail=True, methods=['get'], url_path='processing-progress')
+    def processing_progress(self, request, pk=None):
+        task = self.get_object()
+
+        events = []
+
+        events.append({
+            'event_type': 'created',
+            'event_type_display': '任务创建',
+            'event_time': task.created_at,
+            'operator': task.creator,
+            'description': f'复核任务已创建，来源：{task.get_source_display()}',
+        })
+
+        if task.assign_time:
+            events.append({
+                'event_type': 'assigned',
+                'event_type_display': '任务指派',
+                'event_time': task.assign_time,
+                'operator': task.reviewer,
+                'description': f'任务已指派给 {task.reviewer}',
+            })
+
+        if task.completed_time:
+            events.append({
+                'event_type': 'completed',
+                'event_type_display': '任务完成',
+                'event_time': task.completed_time,
+                'operator': task.reviewer,
+                'description': f'复核完成，结论：{task.get_review_result_display()}',
+            })
+
+        if task.cancelled_time:
+            events.append({
+                'event_type': 'cancelled',
+                'event_type_display': '任务取消',
+                'event_time': task.cancelled_time,
+                'operator': None,
+                'description': f'任务已取消，原因：{task.cancel_reason}',
+            })
+
+        events.sort(key=lambda x: x['event_time'])
+
+        total_steps = 3
+        current_step = 1
+        if task.assign_time:
+            current_step = 2
+        if task.completed_time or task.cancelled_time:
+            current_step = 3
+
+        return Response({
+            'task_id': task.id,
+            'task_code': task.task_code,
+            'status': task.status,
+            'status_display': task.get_status_display(),
+            'current_step': current_step,
+            'total_steps': total_steps,
+            'progress_percent': round(current_step / total_steps * 100, 0),
+            'events': events,
+        })
 
     @property
     def paginator(self):

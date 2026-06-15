@@ -31,6 +31,27 @@ class AbnormalStatus(models.TextChoices):
     CLOSED = 'closed', '已关闭'
 
 
+class ReviewTaskStatus(models.TextChoices):
+    PENDING_ASSIGN = 'pending_assign', '待指派'
+    PROCESSING = 'processing', '处理中'
+    COMPLETED = 'completed', '已完成'
+    CANCELLED = 'cancelled', '已取消'
+
+
+class ReviewTaskSource(models.TextChoices):
+    INVENTORY_DIFF = 'inventory_diff', '清点差异'
+    OBSERVING_TRAY = 'observing_tray', '观察中托盘'
+    UNCLOSED_ABNORMAL = 'unclosed_abnormal', '未关闭异常'
+    MANUAL = 'manual', '人工创建'
+
+
+class ReviewResult(models.TextChoices):
+    CONFIRMED_ABNORMAL = 'confirmed_abnormal', '确认异常'
+    FALSE_ALARM = 'false_alarm', '误报'
+    PARTIAL_ABNORMAL = 'partial_abnormal', '部分异常'
+    OTHER = 'other', '其他'
+
+
 class Tray(models.Model):
     tray_code = models.CharField(max_length=50, unique=True, verbose_name='托盘编号')
     capacity = models.IntegerField(
@@ -157,3 +178,72 @@ class AbnormalHandling(models.Model):
 
     def __str__(self):
         return f'{self.tray.tray_code} - {self.get_source_display()} - {self.get_status_display()}'
+
+
+class ReviewTask(models.Model):
+    task_code = models.CharField(max_length=50, unique=True, verbose_name='任务编号')
+    tray = models.ForeignKey(
+        Tray, on_delete=models.CASCADE, related_name='review_tasks', verbose_name='托盘'
+    )
+    tray_record = models.ForeignKey(
+        TrayRecord, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='review_tasks', verbose_name='领还记录'
+    )
+    inventory_record = models.ForeignKey(
+        InventoryRecord, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='review_tasks', verbose_name='清点记录'
+    )
+    abnormal_handling = models.ForeignKey(
+        AbnormalHandling, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='review_tasks', verbose_name='异常处理单'
+    )
+    source = models.CharField(
+        max_length=20, choices=ReviewTaskSource.choices,
+        default=ReviewTaskSource.MANUAL, verbose_name='任务来源'
+    )
+    status = models.CharField(
+        max_length=20, choices=ReviewTaskStatus.choices,
+        default=ReviewTaskStatus.PENDING_ASSIGN, verbose_name='任务状态'
+    )
+    reviewer = models.CharField(
+        max_length=50, blank=True, default='', verbose_name='复核人'
+    )
+    review_result = models.CharField(
+        max_length=20, choices=ReviewResult.choices,
+        null=True, blank=True, verbose_name='复核结论'
+    )
+    review_opinion = models.TextField(blank=True, default='', verbose_name='复核意见')
+    review_time = models.DateTimeField(null=True, blank=True, verbose_name='复核时间')
+    description = models.TextField(blank=True, default='', verbose_name='任务描述')
+    priority = models.CharField(
+        max_length=10,
+        choices=[('high', '高'), ('medium', '中'), ('low', '低')],
+        default='medium', verbose_name='优先级'
+    )
+    assign_time = models.DateTimeField(null=True, blank=True, verbose_name='指派时间')
+    completed_time = models.DateTimeField(null=True, blank=True, verbose_name='完成时间')
+    cancelled_time = models.DateTimeField(null=True, blank=True, verbose_name='取消时间')
+    cancel_reason = models.TextField(blank=True, default='', verbose_name='取消原因')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+    creator = models.CharField(
+        max_length=50, blank=True, default='', verbose_name='创建人'
+    )
+
+    class Meta:
+        db_table = 'review_task'
+        verbose_name = '复核任务'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'{self.task_code} - {self.tray.tray_code} - {self.get_status_display()}'
+
+    def save(self, *args, **kwargs):
+        if not self.task_code:
+            from django.utils import timezone
+            import uuid
+            prefix = 'RT'
+            timestamp = timezone.now().strftime('%Y%m%d%H%M%S')
+            self.task_code = f'{prefix}{timestamp}{uuid.uuid4().hex[:4].upper()}'
+        super().save(*args, **kwargs)

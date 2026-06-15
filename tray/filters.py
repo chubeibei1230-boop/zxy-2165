@@ -1,5 +1,5 @@
 import django_filters
-from .models import Tray, TrayRecord, InventoryRecord, AbnormalHandling
+from .models import Tray, TrayRecord, InventoryRecord, AbnormalHandling, ReviewTask
 
 
 class TrayFilter(django_filters.FilterSet):
@@ -58,3 +58,24 @@ class AbnormalHandlingFilter(django_filters.FilterSet):
     class Meta:
         model = AbnormalHandling
         fields = ['tray', 'handler', 'status', 'source']
+
+
+class ReviewTaskFilter(django_filters.FilterSet):
+    tray_code = django_filters.CharFilter(field_name='tray__tray_code', lookup_expr='icontains')
+    area = django_filters.CharFilter(field_name='tray__area', lookup_expr='icontains')
+    responsible_person = django_filters.CharFilter(field_name='tray__responsible_person', lookup_expr='icontains')
+    session = django_filters.CharFilter(field_name='tray_record__session', lookup_expr='icontains')
+    status = django_filters.CharFilter(field_name='status')
+    source = django_filters.CharFilter(field_name='source')
+    reviewer = django_filters.CharFilter(field_name='reviewer', lookup_expr='icontains')
+    priority = django_filters.CharFilter(field_name='priority')
+    start_date = django_filters.DateFilter(field_name='created_at', lookup_expr='gte')
+    end_date = django_filters.DateFilter(field_name='created_at', lookup_expr='lte')
+    review_start_date = django_filters.DateFilter(field_name='review_time', lookup_expr='gte')
+    review_end_date = django_filters.DateFilter(field_name='review_time', lookup_expr='lte')
+    tray_id = django_filters.NumberFilter(field_name='tray__id')
+    review_result = django_filters.CharFilter(field_name='review_result')
+
+    class Meta:
+        model = ReviewTask
+        fields = ['tray', 'status', 'source', 'reviewer', 'priority', 'review_result']

@@ -1,5 +1,5 @@
 import django_filters
-from .models import Tray, TrayRecord, InventoryRecord
+from .models import Tray, TrayRecord, InventoryRecord, AbnormalHandling
 
 
 class TrayFilter(django_filters.FilterSet):
@@ -43,3 +43,18 @@ class InventoryRecordFilter(django_filters.FilterSet):
     class Meta:
         model = InventoryRecord
         fields = ['tray', 'confirm_status']
+
+
+class AbnormalHandlingFilter(django_filters.FilterSet):
+    tray_code = django_filters.CharFilter(field_name='tray__tray_code', lookup_expr='icontains')
+    area = django_filters.CharFilter(field_name='tray__area', lookup_expr='icontains')
+    handler = django_filters.CharFilter(field_name='handler', lookup_expr='icontains')
+    status = django_filters.CharFilter(field_name='status')
+    source = django_filters.CharFilter(field_name='source')
+    start_date = django_filters.DateFilter(field_name='created_at', lookup_expr='gte')
+    end_date = django_filters.DateFilter(field_name='created_at', lookup_expr='lte')
+    tray_id = django_filters.NumberFilter(field_name='tray__id')
+
+    class Meta:
+        model = AbnormalHandling
+        fields = ['tray', 'handler', 'status', 'source']

@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Tray, TrayRecord, InventoryRecord
+from .models import Tray, TrayRecord, InventoryRecord, AbnormalHandling
 
 
 @admin.register(Tray)
@@ -24,3 +24,11 @@ class InventoryRecordAdmin(admin.ModelAdmin):
     list_filter = ['confirm_status', 'confirmer']
     search_fields = ['tray__tray_code', 'diff_description', 'conclusion']
     readonly_fields = ['created_at', 'inventory_time']
+
+
+@admin.register(AbnormalHandling)
+class AbnormalHandlingAdmin(admin.ModelAdmin):
+    list_display = ['tray', 'source', 'handler', 'status', 'expected_completion_time', 'resolved_at', 'closed_at', 'created_at']
+    list_filter = ['status', 'source', 'handler', 'tray__area']
+    search_fields = ['tray__tray_code', 'handler', 'description', 'measures', 'result']
+    readonly_fields = ['created_at', 'updated_at', 'resolved_at', 'closed_at']

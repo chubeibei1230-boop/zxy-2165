@@ -8,13 +8,16 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Tray, TrayRecord, InventoryRecord, TrayStatus, ConfirmStatus
+from .models import Tray, TrayRecord, InventoryRecord, TrayStatus, ConfirmStatus, AbnormalHandling, AbnormalSource, AbnormalStatus
 from .serializers import (
     TraySerializer, TrayRecordSerializer, InventoryRecordSerializer,
     PickupSerializer, ReturnSerializer, InventorySerializer, ConfirmSerializer,
-    ReleaseObservingSerializer
+    ReleaseObservingSerializer,
+    AbnormalHandlingSerializer, AbnormalHandlingDetailSerializer,
+    AbnormalHandlingCreateSerializer, AbnormalHandlingResolveSerializer,
+    AbnormalHandlingCloseSerializer
 )
-from .filters import TrayFilter, TrayRecordFilter, InventoryRecordFilter
+from .filters import TrayFilter, TrayRecordFilter, InventoryRecordFilter, AbnormalHandlingFilter
 
 
 class TrayViewSet(viewsets.ModelViewSet):
@@ -238,6 +241,17 @@ class TrayViewSet(viewsets.ModelViewSet):
             'pending_confirm_count': pending_confirm_count,
             'total_diff_count': abs(total_diff_count),
             'today_pickup_count': today_records,
+            'abnormal_pending_count': AbnormalHandling.objects.filter(
+                status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+            ).count(),
+            'abnormal_resolved_count': AbnormalHandling.objects.filter(
+                status=AbnormalStatus.RESOLVED
+            ).count(),
+            'abnormal_area_distribution': list(
+                AbnormalHandling.objects.filter(
+                    status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+                ).values('tray__area').annotate(count=Count('id')).order_by('-count')
+            ),
         })
 
     @action(detail=False, methods=['get'], url_path='stats/high-diff-trays')
@@ -457,3 +471,180 @@ class InventoryRecordViewSet(viewsets.ReadOnlyModelViewSet):
     filterset_class = InventoryRecordFilter
     search_fields = ['tray__tray_code', 'diff_description', 'conclusion', 'confirmer']
     ordering_fields = ['created_at', 'inventory_time', 'diff_count']
+
+
+class AbnormalHandlingViewSet(viewsets.ModelViewSet):
+    queryset = AbnormalHandling.objects.select_related('tray', 'inventory_record', 'tray_record').all()
+    serializer_class = AbnormalHandlingSerializer
+    filterset_class = AbnormalHandlingFilter
+    search_fields = ['tray__tray_code', 'handler', 'description', 'measures', 'result']
+    ordering_fields = ['created_at', 'updated_at', 'expected_completion_time']
+
+    def get_serializer_class(self):
+        if self.action == 'retrieve':
+            return AbnormalHandlingDetailSerializer
+        if self.action == 'create':
+            return AbnormalHandlingCreateSerializer
+        if self.action == 'resolve':
+            return AbnormalHandlingResolveSerializer
+        if self.action == 'close':
+            return AbnormalHandlingCloseSerializer
+        return AbnormalHandlingSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            tray = Tray.objects.get(id=data['tray_id'])
+        except Tray.DoesNotExist:
+            return Response({'detail': '托盘不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        if tray.status not in [TrayStatus.OBSERVING, TrayStatus.PENDING_CONFIRM, TrayStatus.PENDING_COUNT]:
+            return Response(
+                {'detail': f'当前托盘状态为{tray.get_status_display()}，无需登记异常处理单'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        inventory_record = None
+        if 'inventory_record_id' in data and data.get('inventory_record_id'):
+            try:
+                inventory_record = InventoryRecord.objects.get(id=data['inventory_record_id'], tray=tray)
+            except InventoryRecord.DoesNotExist:
+                return Response({'detail': '清点记录不存在或不属于该托盘'}, status=status.HTTP_400_BAD_REQUEST)
+
+        tray_record = None
+        if 'tray_record_id' in data and data.get('tray_record_id'):
+            try:
+                tray_record = TrayRecord.objects.get(id=data['tray_record_id'], tray=tray)
+            except TrayRecord.DoesNotExist:
+                return Response({'detail': '领还记录不存在或不属于该托盘'}, status=status.HTTP_400_BAD_REQUEST)
+
+        abnormal = AbnormalHandling.objects.create(
+            tray=tray,
+            inventory_record=inventory_record,
+            tray_record=tray_record,
+            source=data.get('source', AbnormalSource.INVENTORY_DIFF),
+            handler=data['handler'],
+            measures=data.get('measures', ''),
+            expected_completion_time=data.get('expected_completion_time'),
+            description=data.get('description', ''),
+            status=AbnormalStatus.PENDING,
+        )
+
+        return Response(
+            AbnormalHandlingDetailSerializer(abnormal).data,
+            status=status.HTTP_201_CREATED
+        )
+
+    @action(detail=True, methods=['post'], serializer_class=AbnormalHandlingResolveSerializer)
+    def resolve(self, request, pk=None):
+        abnormal = self.get_object()
+
+        if abnormal.status not in [AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]:
+            return Response(
+                {'detail': f'当前状态为{abnormal.get_status_display()}，不能处理'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        abnormal.status = AbnormalStatus.RESOLVED
+        abnormal.result = data['result']
+        if data.get('measures'):
+            abnormal.measures = data['measures']
+        abnormal.resolved_at = timezone.now()
+        abnormal.save()
+
+        tray = abnormal.tray
+        if tray.status == TrayStatus.OBSERVING:
+            pending_abnormals = AbnormalHandling.objects.filter(
+                tray=tray,
+                status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+            ).exclude(id=abnormal.id).count()
+
+            pending_confirms = InventoryRecord.objects.filter(
+                tray=tray,
+                confirm_status=ConfirmStatus.PENDING
+            ).count()
+
+            if pending_abnormals == 0 and pending_confirms == 0:
+                tray.status = TrayStatus.AVAILABLE
+                tray.save()
+
+        return Response({
+            'abnormal': AbnormalHandlingDetailSerializer(abnormal).data,
+            'tray': TraySerializer(tray).data,
+        })
+
+    @action(detail=True, methods=['post'], serializer_class=AbnormalHandlingCloseSerializer)
+    def close(self, request, pk=None):
+        abnormal = self.get_object()
+
+        if abnormal.status != AbnormalStatus.RESOLVED:
+            return Response(
+                {'detail': f'当前状态为{abnormal.get_status_display()}，只有已处理状态才能关闭'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        abnormal.status = AbnormalStatus.CLOSED
+        abnormal.closed_at = timezone.now()
+        abnormal.save()
+
+        return Response(AbnormalHandlingDetailSerializer(abnormal).data)
+
+    @action(detail=True, methods=['post'])
+    def start_processing(self, request, pk=None):
+        abnormal = self.get_object()
+
+        if abnormal.status != AbnormalStatus.PENDING:
+            return Response(
+                {'detail': f'当前状态为{abnormal.get_status_display()}，只有待处理状态才能开始处理'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        abnormal.status = AbnormalStatus.PROCESSING
+        abnormal.save()
+
+        return Response(AbnormalHandlingSerializer(abnormal).data)
+
+    @action(detail=False, methods=['get'], url_path='stats/overview')
+    def stats_overview(self, request):
+        pending_count = AbnormalHandling.objects.filter(
+            status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+        ).count()
+
+        resolved_count = AbnormalHandling.objects.filter(
+            status=AbnormalStatus.RESOLVED
+        ).count()
+
+        closed_count = AbnormalHandling.objects.filter(
+            status=AbnormalStatus.CLOSED
+        ).count()
+
+        area_distribution = AbnormalHandling.objects.filter(
+            status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING, AbnormalStatus.RESOLVED]
+        ).values('tray__area').annotate(
+            count=Count('id')
+        ).order_by('-count')
+
+        overdue_count = AbnormalHandling.objects.filter(
+            status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING],
+            expected_completion_time__lt=timezone.now()
+        ).count()
+
+        source_distribution = AbnormalHandling.objects.values('source').annotate(
+            count=Count('id')
+        ).order_by('-count')
+
+        return Response({
+            'pending_count': pending_count,
+            'resolved_count': resolved_count,
+            'closed_count': closed_count,
+            'overdue_count': overdue_count,
+            'area_distribution': list(area_distribution),
+            'source_distribution': list(source_distribution),
+        })

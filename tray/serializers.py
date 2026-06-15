@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Tray, TrayRecord, InventoryRecord, TrayStatus, ConfirmStatus
+from .models import Tray, TrayRecord, InventoryRecord, TrayStatus, ConfirmStatus, AbnormalHandling, AbnormalSource, AbnormalStatus
 
 
 class TraySerializer(serializers.ModelSerializer):
@@ -68,3 +68,44 @@ class ReleaseObservingSerializer(serializers.Serializer):
     tray_id = serializers.IntegerField()
     operator = serializers.CharField(max_length=50)
     remark = serializers.CharField(required=False, default='', allow_blank=True)
+
+
+class AbnormalHandlingSerializer(serializers.ModelSerializer):
+    tray_code = serializers.CharField(source='tray.tray_code', read_only=True)
+    tray_area = serializers.CharField(source='tray.area', read_only=True)
+    source_display = serializers.CharField(source='get_source_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = AbnormalHandling
+        fields = '__all__'
+        read_only_fields = ['created_at', 'updated_at', 'resolved_at', 'closed_at']
+
+
+class AbnormalHandlingDetailSerializer(AbnormalHandlingSerializer):
+    tray_detail = TraySerializer(source='tray', read_only=True)
+    tray_record_detail = TrayRecordSerializer(source='tray_record', read_only=True)
+    inventory_record_detail = InventoryRecordSerializer(source='inventory_record', read_only=True)
+
+    class Meta(AbnormalHandlingSerializer.Meta):
+        fields = '__all__'
+
+
+class AbnormalHandlingCreateSerializer(serializers.Serializer):
+    tray_id = serializers.IntegerField()
+    inventory_record_id = serializers.IntegerField(required=False, allow_null=True)
+    tray_record_id = serializers.IntegerField(required=False, allow_null=True)
+    source = serializers.ChoiceField(choices=AbnormalSource.choices, default=AbnormalSource.INVENTORY_DIFF)
+    handler = serializers.CharField(max_length=50)
+    measures = serializers.CharField(required=False, default='', allow_blank=True)
+    expected_completion_time = serializers.DateTimeField(required=False, allow_null=True)
+    description = serializers.CharField(required=False, default='', allow_blank=True)
+
+
+class AbnormalHandlingResolveSerializer(serializers.Serializer):
+    result = serializers.CharField()
+    measures = serializers.CharField(required=False, default='', allow_blank=True)
+
+
+class AbnormalHandlingCloseSerializer(serializers.Serializer):
+    pass

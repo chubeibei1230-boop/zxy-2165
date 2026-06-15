@@ -18,6 +18,19 @@ class ConfirmStatus(models.TextChoices):
     CONFIRMED = 'confirmed', '已确认'
 
 
+class AbnormalSource(models.TextChoices):
+    INVENTORY_DIFF = 'inventory_diff', '清点差异'
+    OBSERVING_STATUS = 'observing_status', '观察状态'
+    MANUAL = 'manual', '人工登记'
+
+
+class AbnormalStatus(models.TextChoices):
+    PENDING = 'pending', '待处理'
+    PROCESSING = 'processing', '处理中'
+    RESOLVED = 'resolved', '已处理'
+    CLOSED = 'closed', '已关闭'
+
+
 class Tray(models.Model):
     tray_code = models.CharField(max_length=50, unique=True, verbose_name='托盘编号')
     capacity = models.IntegerField(
@@ -106,3 +119,41 @@ class InventoryRecord(models.Model):
 
     def __str__(self):
         return f'{self.tray.tray_code} - 清点差异:{self.diff_count}'
+
+
+class AbnormalHandling(models.Model):
+    tray = models.ForeignKey(Tray, on_delete=models.CASCADE, related_name='abnormal_handlings', verbose_name='托盘')
+    inventory_record = models.ForeignKey(
+        InventoryRecord, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='abnormal_handlings', verbose_name='清点记录'
+    )
+    tray_record = models.ForeignKey(
+        TrayRecord, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='abnormal_handlings', verbose_name='领还记录'
+    )
+    source = models.CharField(
+        max_length=20, choices=AbnormalSource.choices,
+        default=AbnormalSource.INVENTORY_DIFF, verbose_name='异常来源'
+    )
+    handler = models.CharField(max_length=50, verbose_name='处理责任人')
+    measures = models.TextField(blank=True, default='', verbose_name='处理措施')
+    expected_completion_time = models.DateTimeField(null=True, blank=True, verbose_name='预计完成时间')
+    result = models.TextField(blank=True, default='', verbose_name='处理结果')
+    status = models.CharField(
+        max_length=20, choices=AbnormalStatus.choices,
+        default=AbnormalStatus.PENDING, verbose_name='处理状态'
+    )
+    description = models.TextField(blank=True, default='', verbose_name='异常描述')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+    resolved_at = models.DateTimeField(null=True, blank=True, verbose_name='处理完成时间')
+    closed_at = models.DateTimeField(null=True, blank=True, verbose_name='关闭时间')
+
+    class Meta:
+        db_table = 'abnormal_handling'
+        verbose_name = '异常处理单'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'{self.tray.tray_code} - {self.get_source_display()} - {self.get_status_display()}'

@@ -159,6 +159,17 @@ class TrayViewSet(viewsets.ModelViewSet):
         if tray.status == TrayStatus.OBSERVING and not conclusion:
             return Response({'detail': '观察中的托盘确认时必须填写确认结论'}, status=status.HTTP_400_BAD_REQUEST)
 
+        if tray.status == TrayStatus.OBSERVING:
+            pending_abnormal_count = AbnormalHandling.objects.filter(
+                tray=tray,
+                status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+            ).count()
+            if pending_abnormal_count > 0:
+                return Response(
+                    {'detail': f'该托盘存在{pending_abnormal_count}个未处理的异常单，请先处理异常后再确认'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
         pending_count = InventoryRecord.objects.filter(
             tray=tray,
             confirm_status=ConfirmStatus.PENDING
@@ -245,7 +256,7 @@ class TrayViewSet(viewsets.ModelViewSet):
                 status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
             ).count(),
             'abnormal_resolved_count': AbnormalHandling.objects.filter(
-                status=AbnormalStatus.RESOLVED
+                status__in=[AbnormalStatus.RESOLVED, AbnormalStatus.CLOSED]
             ).count(),
             'abnormal_area_distribution': list(
                 AbnormalHandling.objects.filter(
@@ -507,12 +518,34 @@ class AbnormalHandlingViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        source = data.get('source', AbnormalSource.INVENTORY_DIFF)
+
+        if source == AbnormalSource.INVENTORY_DIFF:
+            if not data.get('inventory_record_id'):
+                return Response(
+                    {'detail': '异常来源为"清点差异"时必须指定关联的清点记录'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        if source == AbnormalSource.OBSERVING_STATUS:
+            if tray.status != TrayStatus.OBSERVING:
+                return Response(
+                    {'detail': '异常来源为"观察状态"时托盘必须处于观察中状态'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
         inventory_record = None
         if 'inventory_record_id' in data and data.get('inventory_record_id'):
             try:
                 inventory_record = InventoryRecord.objects.get(id=data['inventory_record_id'], tray=tray)
             except InventoryRecord.DoesNotExist:
                 return Response({'detail': '清点记录不存在或不属于该托盘'}, status=status.HTTP_400_BAD_REQUEST)
+
+            if source == AbnormalSource.INVENTORY_DIFF and inventory_record.diff_count == 0:
+                return Response(
+                    {'detail': '该清点记录无数量差异，不能以"清点差异"来源登记异常处理单'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
         tray_record = None
         if 'tray_record_id' in data and data.get('tray_record_id'):
@@ -558,6 +591,13 @@ class AbnormalHandlingViewSet(viewsets.ModelViewSet):
             abnormal.measures = data['measures']
         abnormal.resolved_at = timezone.now()
         abnormal.save()
+
+        if abnormal.inventory_record and abnormal.inventory_record.confirm_status == ConfirmStatus.PENDING:
+            abnormal.inventory_record.confirm_status = ConfirmStatus.CONFIRMED
+            abnormal.inventory_record.confirmer = abnormal.handler
+            abnormal.inventory_record.confirm_time = timezone.now()
+            abnormal.inventory_record.conclusion = data['result']
+            abnormal.inventory_record.save()
 
         tray = abnormal.tray
         if tray.status == TrayStatus.OBSERVING:
@@ -618,7 +658,7 @@ class AbnormalHandlingViewSet(viewsets.ModelViewSet):
         ).count()
 
         resolved_count = AbnormalHandling.objects.filter(
-            status=AbnormalStatus.RESOLVED
+            status__in=[AbnormalStatus.RESOLVED, AbnormalStatus.CLOSED]
         ).count()
 
         closed_count = AbnormalHandling.objects.filter(
@@ -626,7 +666,7 @@ class AbnormalHandlingViewSet(viewsets.ModelViewSet):
         ).count()
 
         area_distribution = AbnormalHandling.objects.filter(
-            status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING, AbnormalStatus.RESOLVED]
+            status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
         ).values('tray__area').annotate(
             count=Count('id')
         ).order_by('-count')

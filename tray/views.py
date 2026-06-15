@@ -1,0 +1,404 @@
+from datetime import timedelta
+from django.db import models
+from django.db.models import Count, Sum, Avg, Q, F, ExpressionWrapper, IntegerField
+from django.utils import timezone
+from django.conf import settings
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from .models import Tray, TrayRecord, InventoryRecord, TrayStatus, ConfirmStatus
+from .serializers import (
+    TraySerializer, TrayRecordSerializer, InventoryRecordSerializer,
+    PickupSerializer, ReturnSerializer, InventorySerializer, ConfirmSerializer
+)
+from .filters import TrayFilter, TrayRecordFilter, InventoryRecordFilter
+
+
+class TrayViewSet(viewsets.ModelViewSet):
+    queryset = Tray.objects.all()
+    serializer_class = TraySerializer
+    filterset_class = TrayFilter
+    search_fields = ['tray_code', 'area', 'responsible_person', 'applicable_sessions']
+    ordering_fields = ['created_at', 'updated_at', 'tray_code']
+
+    @action(detail=False, methods=['post'], serializer_class=PickupSerializer)
+    def pickup(self, request):
+        serializer = PickupSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            tray = Tray.objects.get(id=data['tray_id'])
+        except Tray.DoesNotExist:
+            return Response({'detail': '托盘不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        if tray.status == TrayStatus.CHECKED_OUT:
+            return Response({'detail': '该托盘已领出，未归还前不能再次领取'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if tray.status not in [TrayStatus.PENDING_PICKUP, TrayStatus.AVAILABLE]:
+            return Response({'detail': f'当前状态为{tray.get_status_display()}，不能领取'}, status=status.HTTP_400_BAD_REQUEST)
+
+        tray.status = TrayStatus.CHECKED_OUT
+        tray.save()
+
+        record = TrayRecord.objects.create(
+            tray=tray,
+            session=data['session'],
+            receiver=data['receiver'],
+            receive_time=timezone.now()
+        )
+
+        return Response({
+            'tray': TraySerializer(tray).data,
+            'record': TrayRecordSerializer(record).data
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['post'], serializer_class=ReturnSerializer)
+    def return_tray(self, request):
+        serializer = ReturnSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            tray = Tray.objects.get(id=data['tray_id'])
+        except Tray.DoesNotExist:
+            return Response({'detail': '托盘不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        if tray.status != TrayStatus.CHECKED_OUT:
+            return Response({'detail': f'当前状态为{tray.get_status_display()}，不能归还'}, status=status.HTTP_400_BAD_REQUEST)
+
+        tray.status = TrayStatus.PENDING_COUNT
+        tray.save()
+
+        latest_record = TrayRecord.objects.filter(tray=tray, is_returned=False).order_by('-created_at').first()
+        if latest_record:
+            latest_record.return_time = timezone.now()
+            latest_record.is_returned = True
+            latest_record.save()
+
+        return Response({
+            'tray': TraySerializer(tray).data,
+            'record': TrayRecordSerializer(latest_record).data if latest_record else None
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['post'], serializer_class=InventorySerializer)
+    def inventory(self, request):
+        serializer = InventorySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            tray = Tray.objects.get(id=data['tray_id'])
+        except Tray.DoesNotExist:
+            return Response({'detail': '托盘不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        if tray.status != TrayStatus.PENDING_COUNT:
+            return Response({'detail': f'当前状态为{tray.get_status_display()}，不能清点'}, status=status.HTTP_400_BAD_REQUEST)
+
+        diff_count = data['actual_count'] - data['expected_count']
+
+        latest_record = TrayRecord.objects.filter(tray=tray).order_by('-created_at').first()
+
+        inventory = InventoryRecord.objects.create(
+            tray=tray,
+            tray_record=latest_record,
+            actual_count=data['actual_count'],
+            expected_count=data['expected_count'],
+            diff_count=diff_count,
+            diff_description=data.get('diff_description', '')
+        )
+
+        threshold = getattr(settings, 'DIFF_THRESHOLD', 5)
+
+        if abs(diff_count) > threshold:
+            tray.status = TrayStatus.OBSERVING
+        else:
+            tray.status = TrayStatus.PENDING_CONFIRM
+
+        tray.save()
+
+        return Response({
+            'tray': TraySerializer(tray).data,
+            'inventory': InventoryRecordSerializer(inventory).data
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['post'], serializer_class=ConfirmSerializer)
+    def confirm(self, request):
+        serializer = ConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            inventory = InventoryRecord.objects.get(id=data['inventory_id'])
+        except InventoryRecord.DoesNotExist:
+            return Response({'detail': '清点记录不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        if inventory.confirm_status == ConfirmStatus.CONFIRMED:
+            return Response({'detail': '该清点记录已确认，无需重复确认'}, status=status.HTTP_400_BAD_REQUEST)
+
+        tray = inventory.tray
+
+        if tray.status not in [TrayStatus.PENDING_CONFIRM, TrayStatus.OBSERVING]:
+            return Response({'detail': f'当前状态为{tray.get_status_display()}，不能确认'}, status=status.HTTP_400_BAD_REQUEST)
+
+        inventory.confirm_status = ConfirmStatus.CONFIRMED
+        inventory.confirmer = data['confirmer']
+        inventory.confirm_time = timezone.now()
+        inventory.conclusion = data.get('conclusion', '')
+        inventory.save()
+
+        if tray.status != TrayStatus.OBSERVING:
+            tray.status = TrayStatus.AVAILABLE
+            tray.save()
+
+        return Response({
+            'tray': TraySerializer(tray).data,
+            'inventory': InventoryRecordSerializer(inventory).data
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], url_path='stats/overview')
+    def stats_overview(self, request):
+        total_trays = Tray.objects.count()
+        status_stats = Tray.objects.values('status').annotate(count=Count('id'))
+        status_map = {s['status']: s['count'] for s in status_stats}
+
+        pending_confirm_count = InventoryRecord.objects.filter(
+            confirm_status=ConfirmStatus.PENDING
+        ).count()
+
+        total_diff_count = InventoryRecord.objects.filter(
+            confirm_status=ConfirmStatus.CONFIRMED
+        ).aggregate(total=Sum('diff_count'))['total'] or 0
+
+        today = timezone.now().date()
+        today_records = TrayRecord.objects.filter(
+            receive_time__date=today
+        ).count()
+
+        return Response({
+            'total_trays': total_trays,
+            'status_stats': status_map,
+            'pending_confirm_count': pending_confirm_count,
+            'total_diff_count': abs(total_diff_count),
+            'today_pickup_count': today_records,
+        })
+
+    @action(detail=False, methods=['get'], url_path='stats/high-diff-trays')
+    def high_diff_trays(self, request):
+        limit = int(request.query_params.get('limit', 10))
+        min_diff_count = int(request.query_params.get('min_diff_count', 3))
+
+        from django.db.models import Case, When, IntegerField
+
+        abs_diff = Sum(
+            Case(
+                When(inventory_records__diff_count__gt=0, then=F('inventory_records__diff_count')),
+                When(inventory_records__diff_count__lt=0, then=-F('inventory_records__diff_count')),
+                default=0,
+                output_field=IntegerField()
+            )
+        )
+
+        trays = Tray.objects.annotate(
+            diff_count=Count('inventory_records', filter=~Q(inventory_records__diff_count=0)),
+            total_diff=abs_diff
+        ).filter(diff_count__gte=min_diff_count).order_by('-diff_count')[:limit]
+
+        data = []
+        for tray in trays:
+            data.append({
+                'tray_id': tray.id,
+                'tray_code': tray.tray_code,
+                'area': tray.area,
+                'responsible_person': tray.responsible_person,
+                'diff_times': tray.diff_count,
+                'total_diff_amount': tray.total_diff or 0,
+                'status': tray.status,
+                'status_display': tray.get_status_display(),
+            })
+
+        return Response(data)
+
+    @action(detail=False, methods=['get'], url_path='stats/area-efficiency')
+    def area_efficiency(self, request):
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+
+        queryset = TrayRecord.objects.all()
+        if start_date:
+            queryset = queryset.filter(receive_time__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(receive_time__lte=end_date + ' 23:59:59')
+
+        queryset = queryset.filter(is_returned=True)
+
+        area_stats = queryset.values('tray__area').annotate(
+            total_turnovers=Count('id'),
+            avg_duration=Avg(F('return_time') - F('receive_time'))
+        ).order_by('-total_turnovers')
+
+        data = []
+        for stat in area_stats:
+            avg_duration = stat['avg_duration']
+            avg_hours = avg_duration.total_seconds() / 3600 if avg_duration else 0
+            data.append({
+                'area': stat['tray__area'],
+                'total_turnovers': stat['total_turnovers'],
+                'avg_duration_hours': round(avg_hours, 2),
+            })
+
+        return Response(data)
+
+    @action(detail=False, methods=['get'], url_path='stats/daily-trend')
+    def daily_trend(self, request):
+        days = int(request.query_params.get('days', 30))
+        end_date = timezone.now().date()
+        start_date = end_date - timedelta(days=days - 1)
+
+        daily_data = []
+        for i in range(days):
+            current_date = start_date + timedelta(days=i)
+            next_date = current_date + timedelta(days=1)
+
+            pickup_count = TrayRecord.objects.filter(
+                receive_time__gte=current_date,
+                receive_time__lt=next_date
+            ).count()
+
+            return_count = TrayRecord.objects.filter(
+                return_time__gte=current_date,
+                return_time__lt=next_date,
+                is_returned=True
+            ).count()
+
+            inventory_count = InventoryRecord.objects.filter(
+                inventory_time__gte=current_date,
+                inventory_time__lt=next_date
+            ).count()
+
+            diff_count = InventoryRecord.objects.filter(
+                inventory_time__gte=current_date,
+                inventory_time__lt=next_date
+            ).aggregate(total=Sum('diff_count'))['total'] or 0
+
+            daily_data.append({
+                'date': current_date.strftime('%Y-%m-%d'),
+                'pickup_count': pickup_count,
+                'return_count': return_count,
+                'inventory_count': inventory_count,
+                'diff_amount': abs(diff_count),
+            })
+
+        return Response(daily_data)
+
+    @action(detail=False, methods=['get'], url_path='stats/abnormal-records')
+    def abnormal_records(self, request):
+        threshold = getattr(settings, 'DIFF_THRESHOLD', 5)
+        min_consecutive = int(request.query_params.get('min_consecutive', 3))
+
+        high_diff_records = InventoryRecord.objects.filter(
+            diff_count__gt=threshold
+        ) | InventoryRecord.objects.filter(
+            diff_count__lt=-threshold
+        )
+        high_diff_records = high_diff_records.select_related('tray').order_by('-inventory_time')[:20]
+
+        high_diff_data = InventoryRecordSerializer(high_diff_records, many=True).data
+
+        late_returns = self._get_late_returns()
+
+        consecutive_diff_persons = self._get_consecutive_diff_persons(min_consecutive)
+
+        missing_conclusion = InventoryRecord.objects.filter(
+            confirm_status=ConfirmStatus.CONFIRMED,
+            conclusion=''
+        ).count()
+
+        pending_confirm = InventoryRecord.objects.filter(
+            confirm_status=ConfirmStatus.PENDING
+        ).count()
+
+        return Response({
+            'high_diff_records': high_diff_data,
+            'late_returns': late_returns,
+            'consecutive_diff_persons': consecutive_diff_persons,
+            'missing_conclusion_count': missing_conclusion,
+            'pending_confirm_count': pending_confirm,
+        })
+
+    def _get_late_returns(self):
+        records = TrayRecord.objects.filter(
+            is_returned=True,
+            return_time__isnull=False,
+            receive_time__isnull=False
+        ).select_related('tray').order_by('-return_time')[:50]
+
+        late_returns = []
+        for i, record in enumerate(records):
+            if i == len(records) - 1:
+                break
+            next_record = records[i + 1]
+            if next_record.session == record.session:
+                continue
+            duration = record.return_time - record.receive_time
+            if duration > timedelta(hours=8):
+                late_returns.append({
+                    'tray_id': record.tray.id,
+                    'tray_code': record.tray.tray_code,
+                    'session': record.session,
+                    'receiver': record.receiver,
+                    'receive_time': record.receive_time,
+                    'return_time': record.return_time,
+                    'duration_hours': round(duration.total_seconds() / 3600, 2),
+                })
+                if len(late_returns) >= 10:
+                    break
+
+        return late_returns
+
+    def _get_consecutive_diff_persons(self, min_count):
+        from django.db.models import Case, When, IntegerField
+
+        abs_diff_sum = Sum(
+            Case(
+                When(diff_count__gt=0, then=F('diff_count')),
+                When(diff_count__lt=0, then=-F('diff_count')),
+                default=0,
+                output_field=IntegerField()
+            )
+        )
+
+        persons = InventoryRecord.objects.filter(
+            confirm_status=ConfirmStatus.CONFIRMED
+        ).exclude(diff_count=0).values('tray__responsible_person').annotate(
+            diff_times=Count('id'),
+            total_diff=abs_diff_sum
+        ).filter(diff_times__gte=min_count).order_by('-diff_times')
+
+        result = []
+        for p in persons:
+            result.append({
+                'responsible_person': p['tray__responsible_person'],
+                'diff_times': p['diff_times'],
+                'total_diff': p['total_diff'] or 0,
+            })
+
+        return result
+
+
+class TrayRecordViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = TrayRecord.objects.all()
+    serializer_class = TrayRecordSerializer
+    filterset_class = TrayRecordFilter
+    search_fields = ['tray__tray_code', 'session', 'receiver']
+    ordering_fields = ['created_at', 'receive_time', 'return_time']
+
+
+class InventoryRecordViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = InventoryRecord.objects.all()
+    serializer_class = InventoryRecordSerializer
+    filterset_class = InventoryRecordFilter
+    search_fields = ['tray__tray_code', 'diff_description', 'conclusion', 'confirmer']
+    ordering_fields = ['created_at', 'inventory_time', 'diff_count']

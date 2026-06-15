@@ -8,7 +8,18 @@ class TraySerializer(serializers.ModelSerializer):
     class Meta:
         model = Tray
         fields = '__all__'
-        read_only_fields = ['created_at', 'updated_at']
+        read_only_fields = ['created_at', 'updated_at', 'status']
+
+    def validate_capacity(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError('容量上限必须大于0')
+        return value
+
+    def validate(self, attrs):
+        if self.instance is not None:
+            if 'status' in self.initial_data:
+                raise serializers.ValidationError({'status': '不能直接修改状态，请通过业务接口进行状态流转'})
+        return attrs
 
 
 class TrayRecordSerializer(serializers.ModelSerializer):
@@ -51,3 +62,9 @@ class ConfirmSerializer(serializers.Serializer):
     inventory_id = serializers.IntegerField()
     confirmer = serializers.CharField(max_length=50)
     conclusion = serializers.CharField(required=False, default='', allow_blank=True)
+
+
+class ReleaseObservingSerializer(serializers.Serializer):
+    tray_id = serializers.IntegerField()
+    operator = serializers.CharField(max_length=50)
+    remark = serializers.CharField(required=False, default='', allow_blank=True)

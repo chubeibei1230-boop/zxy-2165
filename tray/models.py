@@ -1,3 +1,5 @@
+from django.core.exceptions import ValidationError
+from django.core.validators import MinValueValidator
 from django.db import models
 from django.conf import settings
 
@@ -18,7 +20,10 @@ class ConfirmStatus(models.TextChoices):
 
 class Tray(models.Model):
     tray_code = models.CharField(max_length=50, unique=True, verbose_name='托盘编号')
-    capacity = models.IntegerField(verbose_name='容量上限')
+    capacity = models.IntegerField(
+        verbose_name='容量上限',
+        validators=[MinValueValidator(1, message='容量上限必须大于0')]
+    )
     area = models.CharField(max_length=100, verbose_name='所属区域')
     applicable_sessions = models.CharField(max_length=200, verbose_name='适用场次')
     responsible_person = models.CharField(max_length=50, verbose_name='责任人')
@@ -40,6 +45,19 @@ class Tray(models.Model):
 
     def __str__(self):
         return self.tray_code
+
+    def clean(self):
+        if self.capacity is not None and self.capacity <= 0:
+            raise ValidationError({'capacity': '容量上限必须大于0'})
+
+    def is_session_applicable(self, session):
+        if not session or not self.applicable_sessions:
+            return False
+        sessions = [s.strip() for s in self.applicable_sessions.replace('，', ',').split(',')]
+        return session in sessions
+
+    def has_unreturned_record(self):
+        return self.records.filter(is_returned=False).exists()
 
 
 class TrayRecord(models.Model):

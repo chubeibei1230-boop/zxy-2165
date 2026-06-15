@@ -11,7 +11,8 @@ from rest_framework.views import APIView
 from .models import Tray, TrayRecord, InventoryRecord, TrayStatus, ConfirmStatus
 from .serializers import (
     TraySerializer, TrayRecordSerializer, InventoryRecordSerializer,
-    PickupSerializer, ReturnSerializer, InventorySerializer, ConfirmSerializer
+    PickupSerializer, ReturnSerializer, InventorySerializer, ConfirmSerializer,
+    ReleaseObservingSerializer
 )
 from .filters import TrayFilter, TrayRecordFilter, InventoryRecordFilter
 
@@ -34,11 +35,19 @@ class TrayViewSet(viewsets.ModelViewSet):
         except Tray.DoesNotExist:
             return Response({'detail': '托盘不存在'}, status=status.HTTP_404_NOT_FOUND)
 
+        if tray.has_unreturned_record():
+            return Response({'detail': '该托盘存在未归还的领出记录，不能再次领取'}, status=status.HTTP_400_BAD_REQUEST)
+
         if tray.status == TrayStatus.CHECKED_OUT:
             return Response({'detail': '该托盘已领出，未归还前不能再次领取'}, status=status.HTTP_400_BAD_REQUEST)
 
         if tray.status not in [TrayStatus.PENDING_PICKUP, TrayStatus.AVAILABLE]:
             return Response({'detail': f'当前状态为{tray.get_status_display()}，不能领取'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not tray.is_session_applicable(data['session']):
+            return Response({
+                'detail': f'场次"{data["session"]}"不在托盘适用场次范围内，适用场次为：{tray.applicable_sessions}'
+            }, status=status.HTTP_400_BAD_REQUEST)
 
         tray.status = TrayStatus.CHECKED_OUT
         tray.save()
@@ -143,19 +152,65 @@ class TrayViewSet(viewsets.ModelViewSet):
         if tray.status not in [TrayStatus.PENDING_CONFIRM, TrayStatus.OBSERVING]:
             return Response({'detail': f'当前状态为{tray.get_status_display()}，不能确认'}, status=status.HTTP_400_BAD_REQUEST)
 
+        conclusion = data.get('conclusion', '').strip()
+        if tray.status == TrayStatus.OBSERVING and not conclusion:
+            return Response({'detail': '观察中的托盘确认时必须填写确认结论'}, status=status.HTTP_400_BAD_REQUEST)
+
+        pending_count = InventoryRecord.objects.filter(
+            tray=tray,
+            confirm_status=ConfirmStatus.PENDING
+        ).exclude(id=inventory.id).count()
+
         inventory.confirm_status = ConfirmStatus.CONFIRMED
         inventory.confirmer = data['confirmer']
         inventory.confirm_time = timezone.now()
-        inventory.conclusion = data.get('conclusion', '')
+        inventory.conclusion = conclusion
         inventory.save()
 
-        if tray.status != TrayStatus.OBSERVING:
+        if pending_count == 0:
             tray.status = TrayStatus.AVAILABLE
             tray.save()
 
         return Response({
             'tray': TraySerializer(tray).data,
             'inventory': InventoryRecordSerializer(inventory).data
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['post'], serializer_class=ReleaseObservingSerializer)
+    def release_observing(self, request):
+        serializer = ReleaseObservingSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            tray = Tray.objects.get(id=data['tray_id'])
+        except Tray.DoesNotExist:
+            return Response({'detail': '托盘不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        if tray.status != TrayStatus.OBSERVING:
+            return Response({'detail': f'当前状态为{tray.get_status_display()}，不是观察中状态，无需解除'}, status=status.HTTP_400_BAD_REQUEST)
+
+        pending_count = InventoryRecord.objects.filter(
+            tray=tray,
+            confirm_status=ConfirmStatus.PENDING
+        ).count()
+        if pending_count > 0:
+            return Response({'detail': f'该托盘还有{pending_count}条待确认的清点记录，请先确认完毕'}, status=status.HTTP_400_BAD_REQUEST)
+
+        remark = data.get('remark', '').strip()
+        if not remark:
+            return Response({'detail': '解除观察时必须填写处理说明'}, status=status.HTTP_400_BAD_REQUEST)
+
+        tray.status = TrayStatus.AVAILABLE
+        if tray.remark:
+            tray.remark = tray.remark + f'\n[{timezone.now().strftime("%Y-%m-%d %H:%M:%S")}] 解除观察，操作人：{data["operator"]}，说明：{remark}'
+        else:
+            tray.remark = f'[{timezone.now().strftime("%Y-%m-%d %H:%M:%S")}] 解除观察，操作人：{data["operator"]}，说明：{remark}'
+        tray.save()
+
+        return Response({
+            'tray': TraySerializer(tray).data,
+            'detail': '已成功解除观察状态，托盘恢复可用'
         }, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='stats/overview')
